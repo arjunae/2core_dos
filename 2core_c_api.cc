@@ -62,6 +62,15 @@ extern "C" uint32_t core2_getPayloadBase(void) {
     return core2.payloadBase;
 }
 
+extern "C" uint32_t core2_allocPhys(uint32_t size) {
+    uint16_t xmsHandle = 0;
+    return allocXMS(size, &xmsHandle);
+}
+
+extern "C" uint32_t core2_getWorkerPhys(void) {
+    return core2.workerPhys;
+}
+
 extern "C" void core2_writeLinear(uint32_t linearAddr, void* src, uint32_t size) {
     _dosmemputb(src, size, linearAddr);
 }

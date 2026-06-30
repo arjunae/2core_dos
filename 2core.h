@@ -120,6 +120,7 @@ public:
 	uint32_t getTramPhys();
 	void wakeAp();
 	bool setupSys(const char* filePath);
+	void recomputeOffsets();
 	uint32_t workerPhys = 0;
 private:
 	void* workerHeap = nullptr;

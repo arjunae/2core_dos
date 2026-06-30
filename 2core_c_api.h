@@ -88,6 +88,7 @@ bool     core2_checkTaskEvent(uint32_t *outTicket, uint32_t *outReady, uint32_t 
 bool     core2_setupSys(const char* filePath);
 
 uint32_t core2_getPayloadBase(void);
+uint32_t core2_getWorkerPhys(void);
 uint32_t core2_getDataOff(void);
 uint32_t core2_allocPhys(uint32_t size);
 

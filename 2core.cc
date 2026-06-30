@@ -11,95 +11,96 @@
 #include "2core.h"
 #include <sys/nearptr.h>
 #include <cstring>
-// VGA-Textpuffer (Segment B800:0000, Farbe 0x07=grau auf schwarz, 0x20=Leerzeichen)
+#include <cstddef>   // offsetof
+// VGA text buffer (segment B800:0000, color 0x07=gray on black, 0x20=space)
 static constexpr uint32_t VGA_TEXT_BASE        = 0xB8000u;
-static constexpr uint16_t VGA_BLANK_CELL       = 0x0720u;  // Attribut 07 + ' '
+static constexpr uint16_t VGA_BLANK_CELL       = 0x0720u;  // Attribute 07 + ' '
 
-// Local APIC (Memory-Mapped I/O, physische Basisadresse)
+// Local APIC (memory-mapped I/O, physical base address)
 static constexpr uint32_t LAPIC_PHYS_BASE      = 0xFEE00000u;
 
-// Local APIC Register-Offsets (relativ zu LAPIC_PHYS_BASE)
+// Local APIC register offsets (relative to LAPIC_PHYS_BASE)
 static constexpr uint32_t LAPIC_SVR            = 0x0F0u;   // Spurious Vector Register
-static constexpr uint32_t LAPIC_ICR_HIGH       = 0x310u;   // Interrupt Command Register (obere 32 Bit)
-static constexpr uint32_t LAPIC_ICR_LOW        = 0x300u;   // Interrupt Command Register (untere 32 Bit)
+static constexpr uint32_t LAPIC_ICR_HIGH       = 0x310u;   // Interrupt Command Register (upper 32 bits)
+static constexpr uint32_t LAPIC_ICR_LOW        = 0x300u;   // Interrupt Command Register (lower 32 bits)
 
-// APIC SVR-Wert: APIC enable (Bit 8) + Spurious-Vektor 0xFF
+// APIC SVR value: APIC enable (bit 8) + spurious vector 0xFF
 static constexpr uint32_t LAPIC_SVR_ENABLE     = 0x1F0u;
 
-// IPI-Kommandowörter für ICR_LOW
-static constexpr uint32_t LAPIC_INIT_ASSERT    = 0x0000C500u;  // INIT IPI, Level=assert
-static constexpr uint32_t LAPIC_INIT_DEASSERT  = 0x00008500u;  // INIT IPI, Level=deassert
-static constexpr uint32_t LAPIC_SIPI_BASE      = 0x00004600u;  // STARTUP IPI (Vektor-Feld wird OR-verknüpft)
-static constexpr uint32_t LAPIC_NMI_IPI        = 0x00004400u;  // NMI IPI (für AP-Wake)
-static constexpr uint32_t LAPIC_INIT_NMI_STOP  = 0x000C4500u;  // INIT via NMI für erzwungenen AP-Stop
+// IPI command words for ICR_LOW
+static constexpr uint32_t LAPIC_INIT_ASSERT    = 0x0000C500u;  // INIT IPI, level=assert
+static constexpr uint32_t LAPIC_INIT_DEASSERT  = 0x00008500u;  // INIT IPI, level=deassert
+static constexpr uint32_t LAPIC_SIPI_BASE      = 0x00004600u;  // STARTUP IPI (vector field is OR'ed in)
+static constexpr uint32_t LAPIC_NMI_IPI        = 0x00004400u;  // NMI IPI (for AP wake)
+static constexpr uint32_t LAPIC_INIT_NMI_STOP  = 0x000C4500u;  // INIT via NMI for forced AP stop
 
-// ICR Delivery-Status
+// ICR delivery status
 static constexpr uint32_t LAPIC_ICR_SEND_PENDING = (1u << 12);
 
-// BIOS-Tick-Zähler ~18,2 Hz
+// BIOS tick counter ~18.2 Hz
 static constexpr uint32_t BIOS_TICK_OFFSET     = 0x46Cu;
 
-// Port für µs-Delays
+// Port for microsecond delays
 static constexpr uint16_t PORT_DIAG            = 0x80u;
 
-// AP-Panik-Marker, den der Exception-Handler in TaskInt::status schreibt
+// AP panic marker that the exception handler writes into TaskInt::status
 static constexpr uint32_t AP_PANIC_MARKER      = 0xEEu;
 
-// Speicher-Layout relativ zu alignPhysical / dosBlockBase
-static constexpr uint32_t MEM_OFF_TASK         = 0x2000u;  // TaskInt-Struktur
-static constexpr uint32_t MEM_OFF_PAYLOAD      = 0x3000u;  // Payload-Puffer
-static constexpr uint32_t MEM_OFF_DATA         = 0x7000u;  // Datenpuffer
+// Memory layout relative to alignPhysical / dosBlockBase
+static constexpr uint32_t MEM_OFF_TASK         = 0x2000u;  // TaskInt structure
+static constexpr uint32_t MEM_OFF_PAYLOAD      = 0x3000u;  // Payload buffer
+static constexpr uint32_t MEM_OFF_DATA         = 0x7000u;  // Data buffer
 
-// IDT-Offset innerhalb des Trampolins
+// IDT offset within the trampoline
 static constexpr uint32_t TRAM_IDT_OFFSET      = 5120u;
 
-// IDT-Gate-Felder
-static constexpr uint16_t IDT_CS_SELECTOR      = 0x0018u;  // Flat 32-Bit-Code-Segment
+// IDT gate fields
+static constexpr uint16_t IDT_CS_SELECTOR      = 0x0018u;  // Flat 32-bit code segment
 static constexpr uint8_t  IDT_GATE_FLAGS       = 0x8Eu;    // Present, DPL=0
 
-// Kapselt alle MMIO-Zugriffe auf den Local APIC
+// Encapsulates all MMIO accesses to the Local APIC
 class LocalApic {
 public:
-	// Mappt LAPIC_PHYS_BASE in den Adressraum.  Gibt false zurück wenn
-	// __dpmi_physical_address_mapping fehlschlägt (kein APIC vorhanden /
-	// DPMI-Fehler).  Muss vor allen anderen Methoden aufgerufen werden.
+	// Maps LAPIC_PHYS_BASE into the address space. Returns false if
+	// __dpmi_physical_address_mapping fails (no APIC present /
+	// DPMI error). Must be called before any other method.
 	bool init() {
 		sel_ = mapMem(LAPIC_PHYS_BASE);
 		return sel_ != -1;
 	}
 
-	// Aktiviert den APIC und setzt den Spurious-Interrupt-Vektor.
+	// Enables the APIC and sets the spurious interrupt vector.
 	void enable() const {
 		write(LAPIC_SVR, LAPIC_SVR_ENABLE);
 	}
 
-	// Sendet INIT IPI (assert) an die angegebene APIC-ID.
+	// Sends INIT IPI (assert) to the given APIC ID.
 	void sendInitAssert(uint8_t apicId) const {
 		writeIcr(apicId, LAPIC_INIT_ASSERT);
 	}
 
-	// Sendet INIT IPI (deassert) -- schließt die INIT-Sequenz ab.
+	// Sends INIT IPI (deassert) -- completes the INIT sequence.
 	void sendInitDeassert(uint8_t apicId) const {
 		writeIcr(apicId, LAPIC_INIT_DEASSERT);
 	}
 
-	// Sendet einen STARTUP IPI mit dem angegebenen Trampolin-Page-Index.
+	// Sends a STARTUP IPI with the given trampoline page index.
 	void sendSipi(uint8_t apicId, uint8_t tramPage) const {
 		writeIcr(apicId, LAPIC_SIPI_BASE | tramPage);
 	}
 
-	// Sendet einen NMI IPI -- weckt einen haltenden AP.
+	// Sends an NMI IPI -- wakes a halted AP.
 	void sendNmi(uint8_t apicId) const {
 		writeIcr(apicId, LAPIC_NMI_IPI);
 	}
 
-	// Sendet INIT-via-NMI um den AP hart zu stoppen (erzwungener Shutdown).
+	// Sends INIT-via-NMI to forcibly stop the AP (forced shutdown).
 	void sendInitNmiStop() const {
 		write(LAPIC_ICR_LOW, LAPIC_INIT_NMI_STOP);
 	}
 
-	// Blockiert bis das Delivery-Status-Bit im ICR gelöscht ist (IPI zugestellt).
-	// Verhindert verlorene IPIs in VirtualBox.
+	// Blocks until the delivery status bit in the ICR is cleared (IPI delivered).
+	// Prevents lost IPIs in VirtualBox.
 	void waitIdle() const {
 		for (uint32_t spin = 0; spin < 1000000; spin++) {
 			if ((read(LAPIC_ICR_LOW) & LAPIC_ICR_SEND_PENDING) == 0) return;
@@ -120,8 +121,8 @@ private:
 		_farpokel(sel_, reg, val);
 	}
 
-	// Schreibt zuerst ICR_HIGH (Ziel-APIC-ID), dann ICR_LOW (Befehl).
-	// Die Reihenfolge ist laut Intel SDM zwingend: ICR_LOW löst den IPI aus.
+	// Writes ICR_HIGH (target APIC ID) first, then ICR_LOW (command).
+	// The order is mandatory per the Intel SDM: ICR_LOW triggers the IPI.
 	void writeIcr(uint8_t apicId, uint32_t cmd) const {
 		write(LAPIC_ICR_HIGH, (uint32_t)apicId << 24);
 		write(LAPIC_ICR_LOW,  cmd);
@@ -149,11 +150,11 @@ void (*oldTerm)(int) = NULL;
 static uint32_t xms_entry = 0;
 static uint8_t sysState = 0;
 
-// Fix 1 echte APIC ID des AP merken wird in startAp gesetzt Auf VBox ist das 1
-// auf echter HW haengt sie von der Topologie ab.
+// Fix 1: remember the AP's real APIC ID; set in startAp. On VBox it's 1,
+// on real HW it depends on the topology.
 static uint8_t g_apId = 1;
 
-// Singleton-Instanz des Local APIC -- wird in setupSys initialisiert.
+// Singleton instance of the Local APIC -- initialized in setupSys.
 static LocalApic apic_;
 static void initXms() {
 	__dpmi_regs regs;
@@ -212,7 +213,7 @@ void* loadBin(const char* filePath, uint32_t* physAddr) {
 	uint32_t stackSize = 150 * 1024; // 150KB total for AP stack, dataOff, taskOff, and transfer buffer
 	g_workerStackOffset = byteSize + stackSize - 4; // Top of the allocation
 
-	// DOS-Transferspeicher: 4096-Byte-Puffer + XMS-MoveStruct (258 Paragraphs)
+	// DOS transfer memory: 4096-byte buffer + XMS MoveStruct (258 paragraphs)
 	int dosSel = 0;
 	int dosSeg = __dpmi_allocate_dos_memory(258, &dosSel);
 	if (dosSeg == -1) {
@@ -222,14 +223,14 @@ void* loadBin(const char* filePath, uint32_t* physAddr) {
 		return NULL;
 	}
 
-	// Buffer beginnt bei dosSeg:0000
+	// Buffer starts at dosSeg:0000
 	uint8_t* dosLinearPtr = (uint8_t*)((dosSeg * 16) + __djgpp_conventional_base);
 
-	// Struktur beginnt exakt 4096 Bytes (256 Paragraphs) spaeter
+	// Structure starts exactly 4096 bytes (256 paragraphs) later
 	uint32_t structSeg = dosSeg + 256;
 	XMS_MoveStruct* moveInfoPtr = (XMS_MoveStruct*)((structSeg * 16) + __djgpp_conventional_base);
 
-	// XMS High-Memory anfordern + sperren via allocXMS; Handle fuer den Move merken
+	// Request + lock XMS high memory via allocXMS; remember handle for the move
 	uint16_t xmsHandle = 0;
 	uint32_t actPhys = allocXMS(byteSize + stackSize, &xmsHandle);
 	if (actPhys == 0) {
@@ -240,8 +241,8 @@ void* loadBin(const char* filePath, uint32_t* physAddr) {
 		return NULL;
 	}
 
-	// Struktur im DOS-Speicher initialisieren
-	// WICHTIG: XMS erwartet bei Handle 0 ein Segment:Offset Format!
+	// Initialize the structure in DOS memory
+	// XMS expects a segment:offset format for handle 0!
 	__dpmi_regs rregs;
 	moveInfoPtr->srcHandle  = 0;
 	moveInfoPtr->srcOffset  = ((uint32_t)dosSeg << 16) | 0x0000;
@@ -258,10 +259,10 @@ void* loadBin(const char* filePath, uint32_t* physAddr) {
 		moveInfoPtr->length     = (chunkSize + 1) & ~1;
 		moveInfoPtr->destOffset = currentDestOffset;
 
-		// Saubere Uebergabe der Struktur via DS:SI an den XMS-Treiber
+		// Clean handover of the structure via DS:SI to the XMS driver
 		memset(&rregs, 0, sizeof(rregs));
 		rregs.x.ax = 0x0B00;
-		rregs.x.ds = structSeg; // Segment der Struktur
+		rregs.x.ds = structSeg; // Segment of the structure
 		rregs.x.si = 0x0000;    // Offset 0
 		rregs.x.cs = xms_entry >> 16;
 		rregs.x.ip = xms_entry & 0xFFFF;
@@ -295,11 +296,11 @@ void* loadBin(const char* filePath, uint32_t* physAddr) {
 
 }
 
-/* BSP seitiges clflush einer dos ds relativen Adresse Offset in Konventional
-* speicher Erzwingt dass der BSP beim naechsten Read die vom AP geflushte
-* Speicherzeile aus dem RAM neu laedt statt seine eigene veraltete Cache Kopie
-* zu sehen Gleiche fs dos ds Technik wie in prepTram kein nearptr noetig
-* Auf echter HW noetig in VBox SMP kohaerent nur ein No Op Kosten
+/* BSP-side clflush of a dos_ds-relative address (offset in conventional
+* memory). Forces the BSP to reload the cache line flushed by the AP from
+* RAM on the next read, instead of seeing its own stale cache copy.
+* Same fs/dos_ds technique as in prepTram, no nearptr needed.
+* Required on real HW; in VBox SMP is coherent, so it's just a no-op cost.
 */
 static inline void bspClflush(uint32_t dsOffset) {
 	asm volatile(
@@ -311,38 +312,38 @@ static inline void bspClflush(uint32_t dsOffset) {
 	asm volatile("mfence" ::: "memory");
 }
 
-/* AP-Panik-Report aus TaskInt lesen
-* Red-Screen-Erkennung. Der AP-Exception-Handler (apboot.asm) schreibt im
-* Fehlerfall in TaskInt (Offsets aus 2core.h):
-*   status = 0xEE        Panik-Marker
-*   intFlg = Vektor      (0=#DE, 6=#UD, 13=#GP, 14=#PF, ...) -- bewusst intFlg
-*                        und NICHT intEax: intEax wird BSP-seitig (spawn,
-*                        handlePendingInterrupts) beschrieben, dann ueberdeckt
-*                        die dirty BSP-Kopie beim clflush den AP-Wert. intFlg
-*                        fasst der BSP nirgends an -> kommt sauber durch.
-*   intEcx = Error-Code  (CPU-Fehlercode, 0 falls keiner)
+/* Read AP panic report from TaskInt
+* Red-screen detection. On error, the AP exception handler (apboot.asm)
+* writes into TaskInt (offsets from 2core.h):
+*   status = 0xEE        panic marker
+*   intFlg = vector      (0=#DE, 6=#UD, 13=#GP, 14=#PF, ...) -- deliberately intFlg
+*                        and NOT intEax: intEax is written on the BSP side (spawn,
+*                        handlePendingInterrupts), so the dirty BSP copy would
+*                        overwrite the AP value on clflush. The BSP never touches
+*                        intFlg -> it comes through cleanly.
+*   intEcx = error code  (CPU error code, 0 if none)
 *   intEdx = EIP         (faulting instruction)
-*   intEsi = CR2         (lineare Fehleradresse, nur bei #PF sinnvoll)
+*   intEsi = CR2         (linear fault address, only meaningful for #PF)
 *   intEdi = EFLAGS
-*   intEbx bleibt die Proof-of-Life-APIC-ID (alive check).
-* Der Handler benutzt nur mfence (kein clflush), daher hier vor dem Lesen die
-* betreffenden Cache-Zeilen invalidieren. Rueckgabe true bei vorliegender Panik;
-* die Felder werden dann nach panic.txt geschrieben und auf stdout ausgegeben.
+*   intEbx stays the proof-of-life APIC ID (alive check).
+* The handler uses only mfence (no clflush), so invalidate the relevant cache
+* lines here before reading. Returns true if a panic is present;
+* the fields are then written to panic.txt and printed to stdout.
 */
 static bool apPanicReport(TaskInt* taskPtr, uint32_t statusOff, uint32_t taskOff) {
 	bspClflush(statusOff);
 	if ((uint32_t)taskPtr->status != AP_PANIC_MARKER) return false;
 
-	// intEax(548)..intFlg(572) liegen alle in derselben 64-Byte-Zeile (taskOff
-	// ist seitenausgerichtet) -> ein einziger Flush deckt alle int-Felder ab.
-	bspClflush(taskOff + 548);
+	// intEax(548)..intFlg(572) all lie in the same 64-byte line (taskOff is
+	// page-aligned) -> a single flush covers all the int fields.
+	bspClflush(taskOff + offsetof(TaskInt, intEax));
 
-	uint32_t vec = taskPtr->intFlg;          // Vektor (in intFlg, s.u.)
-	uint32_t err = taskPtr->intEcx;          // Error-Code
+	uint32_t vec = taskPtr->intFlg;          // vector (in intFlg, see above)
+	uint32_t err = taskPtr->intEcx;          // error code
 	uint32_t eip = taskPtr->intEdx;          // faulting EIP
 	uint32_t cr2 = taskPtr->intEsi;          // CR2
 	uint32_t efl = taskPtr->intEdi;          // EFLAGS
-	uint32_t aid = taskPtr->intEbx;          // Proof-of-Life APIC-ID
+	uint32_t aid = taskPtr->intEbx;          // proof-of-life APIC ID
 
 	FILE *f = fopen("panic.txt", "w");
 	if (f) {
@@ -398,10 +399,10 @@ bool CoreTwoAPI::checkTaskEvent(uint32_t &outTicket, uint32_t &outReady, uint32_
 	}
 	asm volatile("" ::: "memory");
 
-	uint32_t resRingO = taskOff + 584;
+	uint32_t resRingO = taskOff + offsetof(TaskInt, resRing);
 	
-	// Echte HW headIdx wird vom AP geschrieben vor dem Read flushen
-	// Sonst sieht der BSP ewig seine eigene veraltete Kopie
+	// Real HW: headIdx is written by the AP, flush before reading.
+	// Otherwise the BSP sees its own stale copy forever.
 	if (doFlush) {
 		bspClflush(resRingO + 0);
 	}
@@ -412,11 +413,11 @@ bool CoreTwoAPI::checkTaskEvent(uint32_t &outTicket, uint32_t &outReady, uint32_
 
 	if (head != tail) {
 		uint32_t dataArrPhys = taskPtr->resRing.dataArrPhys;
-		uint32_t slotO = dataArrPhys + (tail * 76);
+		uint32_t slotO = dataArrPhys + (tail * sizeof(ResultSlot));
 
-		// Slot Daten ebenfalls frisch aus dem RAM holen AP Schreibung
+		// Fetch the slot data fresh from RAM as well (AP write)
 		bspClflush(slotO + 0);
-		// Restliche Bytes des 76 Byte Slots flushen
+		// flush remaining bytes of the slot (second cache line)
 		bspClflush(slotO + 64);
 
 		outTicket = _farpeekl(_dos_ds, slotO + 0);
@@ -480,40 +481,48 @@ void endTask() {
 }
 
 
+// Derives memoryBase/payloadBase, taskPtr and all task field offsets from the
+// current alignPhysical / taskOff. Requires both to be set. setupSys calls this
+// twice (initial layout and after trampoline setup), so the block lives once.
+void CoreTwoAPI::recomputeOffsets() {
+	memoryBase  = alignPhysical;
+	payloadBase = alignPhysical + MEM_OFF_PAYLOAD;
+
+	taskPtr = (TaskInt*)(__djgpp_conventional_base + taskOff);
+
+	commandOff  = taskOff + offsetof(TaskInt, cmd);
+	statusOff   = taskOff + offsetof(TaskInt, status);
+	inputOff    = taskOff + offsetof(TaskInt, input);
+	resultOff   = taskOff + offsetof(TaskInt, result);
+	tickOff     = taskOff + offsetof(TaskInt, tick);
+	functionOff = taskOff + offsetof(TaskInt, funcPtr);
+	rdyState    = taskOff + offsetof(TaskInt, ready);
+	msgPtrO     = taskOff + offsetof(TaskInt, msgPtr);
+	ticketIdOff = taskOff + offsetof(TaskInt, ticketId);
+	dbgStrOff   = taskOff + offsetof(TaskInt, debugString);
+}
+
 bool CoreTwoAPI::setupSys(const char* filePath) {
 	globTask = this;
 	alignPhysical = initMem();
 	if (!apic_.init()) {
-		printf("[setupSys] FEHLER Local APIC konnte nicht gemappt werden\n");
+		printf("[setupSys] ERROR: Local APIC could not be mapped\n");
 		fflush(stdout);
 		return false;
 	}
 
-	// Phase 2 Worker Binary laden
+	// Phase 2: load worker binary
 	void* binPtr = loadBin(filePath, &this->workerPhys);
 	if (!binPtr) {
 		return false;
 	}
 
-	memoryBase  = alignPhysical;
 	physAddress = alignPhysical;
-	payloadBase = alignPhysical + MEM_OFF_PAYLOAD;
 	taskOff     = alignPhysical + MEM_OFF_TASK;
 	dataOff     = alignPhysical + MEM_OFF_DATA;
 
-	// cbase Zwischenspeicher entfernt um den aktualisierten Wert zu nutzen
-	taskPtr = (TaskInt*)(__djgpp_conventional_base + taskOff);
-
-	commandOff  = taskOff + 0;
-	statusOff   = taskOff + 4;
-	inputOff    = taskOff + 8;
-	resultOff   = taskOff + 12;
-	tickOff     = taskOff + 16;
-	functionOff = taskOff + 20;
-	rdyState    = taskOff + 24;
-	msgPtrO     = taskOff + 28;
-	ticketIdOff = taskOff + 32;
-	dbgStrOff   = taskOff + 36;
+	// derive memoryBase, payloadBase, taskPtr and all *Off fields from taskOff
+	recomputeOffsets();
 
 	taskPtr->cmd      = ApCmd::None;
 	taskPtr->status   = ApStatus::Init;
@@ -531,7 +540,7 @@ bool CoreTwoAPI::setupSys(const char* filePath) {
 	taskPtr->intEcx   = 0;
 	taskPtr->intEdx   = 0;
 
-	// Initialisiere die Ringpuffer Pointer ins HIMEM
+	// Initialize the ring buffer pointers into HIMEM
 	uint32_t workerByteSize = (g_workerStackOffset != 0) ? (g_workerStackOffset - 153600 + 4) : 8192;
 	taskPtr->resRing.dataArrPhys = workerPhys + workerByteSize + 4096; // HIMEM Result Buffer
 	*(uint32_t*)(__djgpp_conventional_base + dataOff + 12) = workerPhys + workerByteSize + 8192; // HIMEM Job Buffer
@@ -543,32 +552,19 @@ bool CoreTwoAPI::setupSys(const char* filePath) {
 	atexit(endTask);
 	sysState |= 2;
 
-	// Trampolin aufbauen
+	// Build trampoline
 	constexpr uint32_t TRAM_SZ = 8192;
 	constexpr uint32_t CACHE_L = 64;
 
-	// prepTram ueberschreibt das Layout mit demselben alignPhysical Basis redundante Neuzuweisung bleibt zur Klarheit erhalten
-	memoryBase  = alignPhysical;
-	payloadBase = alignPhysical + MEM_OFF_PAYLOAD;
-    // taskOff and dataOff are already set above workerPhys
+	// prepTram reuses the same alignPhysical base; taskOff/dataOff already set.
 	trampolinPage = (uint8_t)((alignPhysical & 0xFF000) >> 12);
 
-	taskPtr = (TaskInt*)(__djgpp_conventional_base + taskOff);
-
-	commandOff  = taskOff + 0;
-	statusOff   = taskOff + 4;
-	inputOff    = taskOff + 8;
-	resultOff   = taskOff + 12;
-	tickOff     = taskOff + 16;
-	functionOff = taskOff + 20;
-	rdyState    = taskOff + 24;
-	msgPtrO     = taskOff + 28;
-	ticketIdOff = taskOff + 32;
-	dbgStrOff   = taskOff + 36;
+	// re-derive memoryBase, payloadBase, taskPtr and all *Off fields
+	recomputeOffsets();
 
 	_dosmemputb(apStart, TRAM_SZ, memoryBase);
 
-	// IDT aufbauen
+	// Build IDT
 	uint32_t idtBase = memoryBase + TRAM_IDT_OFFSET;
 	uint32_t baseIsr = memoryBase + (uint32_t)(apIdtIsrStubs - apStart);
 
@@ -598,7 +594,7 @@ bool CoreTwoAPI::setupSys(const char* filePath) {
 
     asm volatile("mfence" ::: "memory");
 
-	// Trampolin Bereich aus dem BSP Cache herausschreiben bevor der AP startet
+	// Flush the trampoline region out of the BSP cache before the AP starts
 	for (uint32_t addr = memoryBase; addr < memoryBase + TRAM_SZ; addr += CACHE_L) {
 		asm volatile(
 			"push %%fs \n\t"
@@ -643,8 +639,8 @@ uint32_t initMem() {
 
 
 uint32_t CoreTwoAPI::startAp(uint8_t apicId) {
-	// Kandidaten: zuerst die uebergebene Nummer, bei Timeout einmalig die
-	// naechst hoehere ID (apicId + 1). Zweiter Eintrag entfaellt bei Overflow.
+	// Candidates: first the passed-in number, on timeout try the next higher
+	// ID (apicId + 1) once. Second entry is omitted on overflow.
 	uint8_t cand[2];
 	int nCand = 0;
 	cand[nCand++] = apicId;
@@ -653,8 +649,8 @@ uint32_t CoreTwoAPI::startAp(uint8_t apicId) {
 	for (int ci = 0; ci < nCand; ci++) {
 		uint8_t cur = cand[ci];
  
-		// Dieselbe ID die nachweislich den AP gebootet hat fuer alle
-		// spaeteren NMI Wakes und INIT IPIs wiederverwenden
+		// Reuse the same ID that demonstrably booted the AP for all
+		// later NMI wakes and INIT IPIs
 		g_apId = cur;
  
 		// Clear old AP panic signature to prevent false alarms
@@ -692,13 +688,13 @@ uint32_t CoreTwoAPI::startAp(uint8_t apicId) {
 		microWait(10000);
  
 		printf("[startAp] waiting for AP...\n"); fflush(stdout);
-		// Auf AP warten 
+		// Wait for AP 
 		uint32_t strtTck = getBiosTick();
 		uint32_t spins   = 0;
 		bool timedOut    = false;
 		while (status() != ApStatus::Ready) {
 			if (apPanicReport(taskPtr, statusOff, taskOff)) {
-				printf("[startAp] AP PANIK waehrend Boot (Details oben / panic.txt)\n");
+				printf("[startAp] AP PANIC during boot (details above / panic.txt)\n");
 				fflush(stdout);
 				exit(1);
 			}
@@ -710,27 +706,27 @@ uint32_t CoreTwoAPI::startAp(uint8_t apicId) {
 		}
  
 		if (!timedOut) {
-			// AP lebt. Echte LAPIC-APIC-ID. Vor dem Lesen flushen sonst sieht der BSP evtl 0.
-			bspClflush(taskOff + 552);            // intEbx-Zeile invalidieren
+			// AP is alive. Real LAPIC APIC ID. Flush before reading, otherwise the BSP might see 0.
+			bspClflush(taskOff + offsetof(TaskInt, intEbx));  // invalidate the intEbx line
 			uint32_t reportedId = taskPtr->intEbx;
 			if (reportedId != 0 && reportedId < 0x100) {
 				g_apId = (uint8_t)reportedId;
 			}
-			printf("[startAp] AP alive auf APIC-ID %u (self-reported %lu)\n",
+			printf("[startAp] AP alive on APIC ID %u (self-reported %lu)\n",
 			       (unsigned)cur, (unsigned long)reportedId);
 			fflush(stdout);
 			return 1;
 		}
  
-		// Timeout auf dieser ID ck naechst hoehere ID
+		// Timeout on this ID -> try the next higher ID
 		if (ci + 1 < nCand) {
-			printf("[startAp] APIC-ID %u kam nicht hoch -> versuche %u\n",
+			printf("[startAp] APIC ID %u did not come up -> trying %u\n",
 			       (unsigned)cur, (unsigned)cand[ci + 1]);
 			fflush(stdout);
 		}
 	}
  
-	printf("[startAp] TIMEOUT: kein AP alive (versucht %u und %u)\n",
+	printf("[startAp] TIMEOUT: no AP alive (tried %u and %u)\n",
 	       (unsigned)apicId, (unsigned)(apicId == 0xFF ? apicId : apicId + 1));
 	fflush(stdout);
 	return 0;
@@ -752,7 +748,7 @@ void CoreTwoAPI::pollDbg(uint32_t flagVal) {
 }
 
 ApStatus CoreTwoAPI::status() {
-	// AP Handshake Write aus dem RAM neu laden seltener flushen
+	// Reload the AP handshake write from RAM; flush less often
 	static uint32_t flushCount = 0;
 	if (flushCount++ % 1000 == 0) {
 		bspClflush(statusOff);
@@ -796,22 +792,22 @@ void CoreTwoAPI::sendData(void *sourcePointer, uint32_t dataSize) {
 }
 
 void CoreTwoAPI::wakeAp() {
-	// Unsere Enqueue Schreibzugriffe muessen global sichtbar sein BEVOR wir das
-	// asleep Flag lesen Store Load Barriere Dekker Seite des Producers
+	// Our enqueue writes must be globally visible BEFORE we read the
+	// asleep flag. Store-load barrier, producer side of Dekker.
 	asm volatile("mfence" ::: "memory");
 
-	// Fix 3 Lost Wakeup Race Der AP kann einen NMI im Fenster
-	// von gesetztem asleep Flag bis zum hlt Befehl verpassen
-	// Deshalb NMI so lange wiederholen bis der AP den Wake quittiert
-	// Ist der Kern schon wach ist das sofort ein No Op
+	// Lost-wakeup race: the AP can miss an NMI in the window
+	// between setting the asleep flag and the hlt instruction.
+	// So repeat the NMI until the AP acknowledges the wake.
+	// If the core is already awake this is an immediate no-op.
 	for (int attempt = 0; attempt < 1000; attempt++) {
-		bspClflush(taskOff + 556);
+		bspClflush(taskOff + offsetof(TaskInt, intEcx));
 		if (taskPtr->intEcx != 1) return;
 		apic_.waitIdle();
 		apic_.sendNmi(g_apId);
 		for (int s = 0; s < 20000; s++) {
 			if (s % 1000 == 0) {
-				bspClflush(taskOff + 556);
+				bspClflush(taskOff + offsetof(TaskInt, intEcx));
 			}
 			if (taskPtr->intEcx != 1) return;
 			asm volatile("pause");
@@ -871,7 +867,7 @@ uint32_t CoreTwoAPI::getPayloadBase() {
 uint32_t allocXMS(uint32_t size_bytes, uint16_t* outHandle) {
     if (outHandle) *outHandle = 0;
 
-    // XMS-Treiber-Einsprungpunkt sicherstellen (initXms macht den 0x4300-Check)
+    // Ensure the XMS driver entry point (initXms does the 0x4300 check)
     if (xms_entry == 0) {
         initXms();
         if (xms_entry == 0) return 0;
@@ -880,7 +876,7 @@ uint32_t allocXMS(uint32_t size_bytes, uint16_t* outHandle) {
     uint32_t size_kb = (size_bytes + 1023) / 1024;
     __dpmi_regs r;
 
-    // XMS 0x09: High-Memory-Block anfordern
+    // XMS 0x09: request high memory block
     memset(&r, 0, sizeof(r));
     r.x.ax = 0x0900;
     r.x.dx = (uint16_t)size_kb;
@@ -890,7 +886,7 @@ uint32_t allocXMS(uint32_t size_bytes, uint16_t* outHandle) {
     if (r.x.ax != 1) return 0;
     uint16_t xms_handle = r.x.dx;
 
-    // XMS 0x0C: Block sperren -> physische Adresse in DX:BX
+    // XMS 0x0C: lock block -> physical address in DX:BX
     memset(&r, 0, sizeof(r));
     r.x.ax = 0x0C00;
     r.x.dx = xms_handle;
