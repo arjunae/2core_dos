@@ -4,7 +4,7 @@
 #define APUTILS_NO_LIBC_ALIASES
 #include "aputils.h"
 
-extern volatile void* g_tskPtr;
+volatile void* g_tskPtr = nullptr;
 MemBlock* freeList = nullptr;
 
 extern "C" {
@@ -36,6 +36,20 @@ void* calloc(size_t num, size_t size) {
 void* aligned_alloc(size_t alignment, size_t size) {
     return malloc(size);
 }
+
+void* memalign(size_t alignment, size_t size) {
+    return malloc(size);
+}
+
+long clock() { return 0; }
+int pthread_mutex_lock(void* m) { return 0; }
+int pthread_mutex_unlock(void* m) { return 0; }
+int pthread_mutex_destroy(void* m) { return 0; }
+int pthread_cond_wait(void* c, void* m) { return 0; }
+int pthread_cond_signal(void* c) { return 0; }
+int pthread_cond_broadcast(void* c) { return 0; }
+int pthread_cond_destroy(void* c) { return 0; }
+int pthread_cancel(void* t) { return 0; }
 
 extern "C" {
 void *memcpy (void *d, const void *s, size_t n) { return rmemcpy (d, s, (uint32_t)n); }

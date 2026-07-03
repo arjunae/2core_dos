@@ -10,7 +10,7 @@ LIBC_CFLAGS="-c -m32 -ffreestanding -fno-builtin -nostdlib -fPIC -O3 -I../includ
 
 i586-pc-msdosdjgpp-g++ $CXXFLAGS edge_cpu2.cc -o edge_cpu2.o
 i586-pc-msdosdjgpp-g++ $CXXFLAGS libc_stubs.cc -o libc_stubs.o
-i586-pc-msdosdjgpp-gcc $CFLAGS ../../edge264-master/src/edge264.c -o edge_core.o
+i586-pc-msdosdjgpp-gcc $CFLAGS ../../edge264-dos/src/edge264.c -o edge_core.o
 
 # ============================================================================
 # Linker-Script inline.

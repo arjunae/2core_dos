@@ -3,7 +3,7 @@
 
 #include "aputils.h" // Include 2CoreDOS Task definitions
 
-#include "../../edge264-master/edge264.h"
+#include "../../edge264-dos/edge264.h"
 #include "core_shared.h"
 
 // =====================================================================
@@ -43,21 +43,15 @@ static inline void safe_clflush(volatile const void *p, size_t n) {
   #define PUB_FRAME_FENCE()     asm volatile("" ::: "memory")
 #endif
 
-volatile void* g_tskPtr = nullptr;
-
 extern "C" __attribute__((section(".text.entry"), force_align_arg_pointer))
 void cpu2_decoder_loop(uint32_t dataPhys, uint32_t taskAddr, uint32_t workerPhys) {
 	uint32_t relTaskAddr = taskAddr - workerPhys;
 	uint32_t relDataPhys = dataPhys - workerPhys;
 	TaskInt* tskPtr = (TaskInt*)relTaskAddr;
-	g_tskPtr = (volatile void*)tskPtr;
 
 	// Progress-Marker ("XX" weiss auf rot) – zeigt, dass der AP ueberhaupt
 	// in den C-Code gesprungen ist. Harmlos, bleibt drin.
 	asm volatile("movl $0x2F582F58, %%fs:0xB8000" ::: "memory");
-
-	// --- ENTFERNT: setMemWbAP(dataPhys/taskAddr) -----------------------
-	// (Page-Table-Edit + cr3-Reload; Crash-Kandidat #3)
 
 	uint32_t apicId;
 	asm volatile("movl %%fs:0xFEE00020, %0" : "=r"(apicId) :: "memory");
@@ -77,13 +71,8 @@ void cpu2_decoder_loop(uint32_t dataPhys, uint32_t taskAddr, uint32_t workerPhys
 	uint32_t heapPtrVal = sharedData->heapPtr;
 	uint32_t heapSzVal  = sharedData->heapSize;
 
-	// --- ENTFERNT: setMemWbAP(heapPtrVal) ------------------------------
-
 	heapPtrVal -= workerPhys;
 	rheapInit((void*)heapPtrVal, heapSzVal);
-
-	// --- ENTFERNT: lfbSetWC()/MTRR-Programmierung + MTRR-Diagnose-Dump --
-	// (wrmsr -> #GP-Risiko; Crash-Kandidat #2)
 
 	Edge264Decoder *dec = edge264_alloc(0, nullptr, nullptr, 0, nullptr, nullptr, nullptr);
 	if (!dec) return;
@@ -96,9 +85,6 @@ void cpu2_decoder_loop(uint32_t dataPhys, uint32_t taskAddr, uint32_t workerPhys
 	for (uint32_t i = 0; i < poolN; i++) { framePool[i] = nullptr; framePoolSz[i] = 0; }
 
 	uint32_t headIdx = *headIdxPtr;
-
-	// --- ENTFERNT: apicTimerInit() -------------------------------------
-	// (unmaskierter periodischer Timer-IRQ Vektor 0x40; Crash-Kandidat #1)
 
 	// Leichtgewichtige Transport-Diagnose (kostet nichts, hilft beim
 	// "0 Frames?"-Debugging). Kann bleiben oder raus.

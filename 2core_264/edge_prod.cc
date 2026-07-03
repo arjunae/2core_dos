@@ -31,9 +31,7 @@
 
 unsigned _stklen = 512 * 1024;
 
-#define DBG(...)  do { printf(__VA_ARGS__); fflush(stdout); } while (0)
-
-static const uint8_t *edge264_find_start_code(const uint8_t *buf, const uint8_t *end, int four_byte) {
+static const uint8_t *edge264_find_start_code(const uint8_t *buf, const uint8_t *end) {
 	while (buf < end - 3) {
 		if (buf[0] == 0 && buf[1] == 0 && buf[2] == 1) return buf;
 		if (buf[0] == 0 && buf[1] == 0 && buf[2] == 0 && buf[3] == 1) return buf + 1;
@@ -223,7 +221,7 @@ int main(int argc, char **argv) {
 
 	uint64_t tsc_hz = calibrate_tsc();
 
-	{ uint32_t rc = core2.startAp(2); }
+	core2.startAp(2);
 
 	core2.spawn(core2.workerPhys);
 
@@ -255,7 +253,7 @@ int main(int argc, char **argv) {
 	{
 		uint32_t prebuf_bytes = 0;
 		while (prebuf_bytes < PREBUFFER_BYTES) {
-			const uint8_t *end = edge264_find_start_code(nal, end0, 0);
+			const uint8_t *end = edge264_find_start_code(nal, end0);
 
 			if (end == end0 && !feof(f)) {
 				uint32_t unparsed_len = end0 - nal;
@@ -317,7 +315,7 @@ int main(int argc, char **argv) {
 
 		poll_frames(taskOff, heapLinPtr, heapPhys, lfb, screen_w, screen_h, framedrop, fps_limit, &start_tv, &frames_decoded, novid);
 
-		const uint8_t *end = edge264_find_start_code(nal, end0, 0);
+		const uint8_t *end = edge264_find_start_code(nal, end0);
 
 		if (end == end0 && !feof(f)) {
 			uint32_t unparsed_len = end0 - nal;

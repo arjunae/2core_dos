@@ -2,7 +2,7 @@
 #include <stdint.h>
 
 #define APUTILS_NO_LIBC_ALIASES
-#include "aputils.h"
+#include "include/aputils.h"
 
 extern volatile void* g_tskPtr;
 MemBlock* freeList = nullptr;
