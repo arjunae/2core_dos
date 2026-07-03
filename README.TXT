@@ -43,7 +43,7 @@ The libs Heart has been enhanced in the following ways:
 - apboot now dynamically builds a 256 entry Interrupt Descriptor Table. This allows the new apPanicReport function to extract the instruction pointer and error codes insted of silently lock up.
 - Its now able to load the worker binary directly into Extended Memory. Conventional memory is preserved exclusively for the tiny real mode boot trampoline.
 - floating point unit and SSE instructions are initialized during boot.
-- It now loads the physical address of the worker from the configuration slot _patchMain and before transferring control to the worker code, the segment registers DS, ES, and SS       are switched to the modified data selector 0x20 so such that  the workers stack functions correctly.
+- It now loads the physical address of the worker from the configuration slot _patchMain and before transferring control to the worker code, the segment registers DS, ES, and SS are switched to the modified data selector 0x20 so such that  the workers stack functions correctly.
 -  A green OK Marker appears when tha AP came up successfully.
 
 aputils.h
@@ -74,4 +74,4 @@ Hey- It was found usable on three machines and virtualbox.
 
 so enjoy debugging-
 Tho.
-@René Heidisch: Free Derry!
+@René Heidisch: Thank you for showing me how to successfully distance myself from bad management that relies on control and restrictions instead of inspiration and responsibility . Free Derry!
