@@ -221,7 +221,7 @@ int main(int argc, char **argv) {
 
 	uint64_t tsc_hz = calibrate_tsc();
 
-	core2.startAp(2);
+	core2.startAp(1);
 
 	core2.spawn(core2.workerPhys);
 

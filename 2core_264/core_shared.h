@@ -5,42 +5,6 @@
 
 // ABI contract between the producer BSP and the worker AP
 
-// The control block sits at dataPhysical + AddWkOff behind the task rings
-#define AddWkOff       0x1000u
-#define FadWkOff       0u
-
-// ResultRing doorbell The worker posts this ticket when the batch is done
-// the producer waits for exactly this ticket via core2 checkTaskEvent
-#define AddTicket      0x0000CAFEu
-#define FadTicket      0x0000FAADu
-#define WORK_DONE_MSG  0x0000D09Eu
-
-// cmd producer to worker
-#define WCMD_IDLE      0u
-#define WCMD_RUN       1u
-#define WCMD_STOP      2u
-
-// status worker to producer heartbeat the libs startAp waits for ==2
-#define WST_BOOT       0u
-#define WST_ALIVE      2u
-#define WST_EXIT       3u
-
-// Payload geometry NUM_COUNT 32 bit integers are processed in place
-#define NUM_COUNT      16u
-#define ADD_CONSTANT   15      // the worker adds this to every element
-
-// WorkBlock the entire cross core interface for this job
-// cmd status doneCount apicId the bring up and command handshake
-// Keep this packed so the byte layout is identical regardless of compiler padding rules on either side
-struct WorkBlock {
-	volatile uint32_t cmd;               // WCMD_*
-	volatile uint32_t status;            // WST_* AP is alive
-	volatile uint32_t doneCount;         // AP increments after each batch
-	volatile uint32_t apicId;            // AP reports its LAPIC id
-
-	volatile int32_t  values[NUM_COUNT]; // in place input then input+15
-} __attribute__((packed, aligned(4)));
-
 #define MAX_NAL_SLOTS 32
 
 // Structure representing a single NAL job in the ring buffer
@@ -88,50 +52,6 @@ struct EdgeData {
 	// AP Debug Variables Offset 1000
 	volatile uint32_t ap_debug;
 	
-} __attribute__((packed, aligned(4)));
-
-// Reserve fuer EINEN dekodierten AAC Frame Backpressure Headroom des Producers
-// LC max 1024 Samples Kanal HE AAC SBR verdoppelt auf 2048 Stereo 16 bit
-// 2048 * 2ch * 2B = 8192 Mit Sicherheitsmarge
-#define PCM_MAX_FRAME_BYTES   16384u
-
-// Pacing Der AP haelt nur diesen Vorlauf an PCM und idlet dann hlt statt den
-// ganzen Ring vollzudekodieren Verhindert den CPU Burst am Anfang Underruns auf
-// Maschinen mit wenigen Host Cores und haelt die Startverzoegerung kurz
-#define PCM_LOW_WATER         (256u * 1024u)   // ~1.5s @ 44k 16 2
-
-// Default Ringgroesse BSP setzt sd pcmRingBytes hier nur als Referenz
-#define PCM_RING_BYTES_DEFAULT (4u * 1024u * 1024u)
-
-// Streaming FaadData Steuer Handshake Felder und PCM Ring Zeiger
-// Liegt wie frueher WorkBlock im DOS Konventionalpuffer die PCM Ringdaten
-// selbst liegen separat im Highmem bei physPcm
-struct FaadData {
-	// Steuer Handshake
-	volatile uint32_t cmd;           // WCMD_*
-	volatile uint32_t status;        // WST_*
-	volatile uint32_t apicId;
-	volatile uint32_t formatReady;   // 1 = outSamplerate outChannels gueltig
-	volatile uint32_t endOfStream;   // 1 = AP hat alle Frames dekodiert
-	volatile uint32_t doneCount;     // Completion Zaehler steigt am Stream Ende
-	volatile uint32_t outSamples;    // gesamt dekodierte Samples informativ
-	volatile uint32_t outError;      // FAAD Fehlercode 0 = ok
-
-	// Eingang AAC
-	volatile uint32_t physSrc;
-	volatile uint32_t srcLen;
-	volatile uint32_t physHeap;
-	volatile uint32_t heapSize;
-
-	// Ausgabeformat gueltig sobald formatReady==1
-	volatile uint32_t outSamplerate;
-	volatile uint32_t outChannels;
-
-	// PCM Ring Daten im Highmem bei physPcm
-	volatile uint32_t physPcm;       // Basis des Ringpuffers Highmem
-	volatile uint32_t pcmRingBytes;  // Ringgroesse in Bytes
-	volatile uint32_t pcmWriteBytes; // absolut geschriebene Bytes NUR AP schreibt
-	volatile uint32_t pcmReadBytes;  // absolut gelesene Bytes NUR BSP schreibt
 } __attribute__((packed, aligned(4)));
 
 #endif
