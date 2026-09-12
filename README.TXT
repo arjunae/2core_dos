@@ -1,4 +1,4 @@
-LIB2CORE - READDME.txt
+LIB2CORE - README.txt
 
 This is lib2Core. Its build upon the shoulders of bloodwych's DOS_multicore [demo](https://www.vogons.org/viewtopic.php?t=111336)
 which was was extended and embedded within this library. The basic Concept is as follows:
@@ -27,7 +27,7 @@ lib2core is following a Producer/Consumer pattern between the two cores:
          │                                                    │
 
 Proudly cherished specialties:
-The secondary core is extremely fast and will begin polling or executing memory operations the absolute microsecond it leaves the apboot.asm trampoline. Therefore, all shared state configurations must be completely written and committed by the host before the AP boot command is fired
+The secondary core is extremely fast and will begin polling or executing memory operations the absolute microsecond it leaves the apboot.asm trampoline. Therefore, all shared state configurations must be completely written and committed by the host before the boot command is called
 All pointers exchanged inside the shared structures (like share_mem or TaskInt) must be absolute physical addresses.
 To access locations sent by the host, the worker must convert it to a relative pointer by subtracting workPhys like [uint32_t rel_adr = targetPhys - workPhys]
 The other way around, the host accesses shared high memory buffers by mapping them via DPMI or converting them using the conventional memory base: 
@@ -68,10 +68,9 @@ lib2core is an educational project. It was created as the result of curiosity re
 As apboot is pure assmbler magic, i used claude to understand, extend and test its functionality.
 I havent wrote a single line of code in there, so i dont raise any claims on that code and
 all credits belong to the original author who invented that magic a century ago. 
-Also id like to thank Andreas Will and Marc K for reviewing the libraries implementation and for their gcc KungFu. 
+Also id like to thank Andreas W and Marc K for reviewing the libraries implementation and for their gcc KungFu. 
 Finally, the whole beast is at prototype stage. (Mid2026)
 Hey- It was found usable on three machines and virtualbox.
 
-so enjoy debugging-
-Tho.
+so enjoy debugging- n Dream on
 @René Heidisch: Thank you for showing me how to successfully distance myself from bad management that relies on control and restrictions instead of inspiration and responsibility . Free Derry!

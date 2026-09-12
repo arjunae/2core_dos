@@ -46,6 +46,11 @@ static constexpr uint16_t PORT_DIAG            = 0x80u;
 // AP panic marker that the exception handler writes into TaskInt::status
 static constexpr uint32_t AP_PANIC_MARKER      = 0xEEu;
 
+// x86 cache line size. Shared between setupSys' trampoline flush loop and
+// checkTaskEvent's result-slot flush -- both need to invalidate the BSP's
+// cached copy of AP written memory in exactly this granularity.
+static constexpr uint32_t CACHE_LINE_BYTES     = 64u;
+
 // Memory layout relative to alignPhysical / dosBlockBase
 static constexpr uint32_t MEM_OFF_TASK         = 0x2000u;  // TaskInt structure
 static constexpr uint32_t MEM_OFF_PAYLOAD      = 0x3000u;  // Payload buffer
@@ -143,18 +148,25 @@ extern "C" {
 uint32_t g_workerStackOffset = 0;
 
 CoreTwoAPI core2;
-CoreTwoAPI *myPipe = &core2;
 CoreTwoAPI *globTask = NULL;
 void (*oldInt)(int) = NULL;
 void (*oldTerm)(int) = NULL;
 static uint32_t xms_entry = 0;
+
+// Bits of sysState. Each is set once its prerequisite step has completed;
+// spawn() refuses to run until the AP side is fully ready.
+enum SysStateFlags : uint8_t {
+	SysState_BinLoaded  = 1u << 0, // loadBin(): worker binary transferred into HIMEM
+	SysState_TaskReady  = 1u << 1, // setupSys(): TaskInt initialized, signal handlers installed
+	SysState_TrampReady = 1u << 2, // setupSys(): AP trampoline + IDT built and cache-flushed
+};
 static uint8_t sysState = 0;
 
-// Fix 1: remember the AP's real APIC ID; set in startAp. On VBox it's 1,
+// remember the AP's real APIC ID; set in startAp. On VBox it's 1,
 // on real HW it depends on the topology.
 static uint8_t g_apId = 1;
 
-// Singleton instance of the Local APIC -- initialized in setupSys.
+// Singleton instance of the Local APIC, initialized in setupSys.
 static LocalApic apic_;
 static void initXms() {
 	__dpmi_regs regs;
@@ -182,21 +194,33 @@ struct XMS_MoveStruct {
 extern "C" {
 
 void* loadBin(const char* filePath, uint32_t* physAddr) {
+	// Resources acquired further down; onError() releases whichever of these
+	// are actually live at the point it's called, so every failure path
+	// below just has to print its own message and `return onError();`
+	FILE* fp = nullptr;
+	int dosSel = -1;
+
+	auto onError = [&]() -> void* {
+		if (dosSel != -1) __dpmi_free_dos_memory(dosSel);
+		if (fp) fclose(fp);
+		*physAddr = 0;
+		return NULL;
+	};
+
 	if (xms_entry == 0) {
 		initXms();
 		if (xms_entry == 0) {
 			printf("[DBG loadBin] FEHLER XMS-Treiber nicht gefunden\n");
-			*physAddr = 0;
-			return NULL;
+			fflush(stdout);
+			return onError();
 		}
 	}
 
-	FILE* fp = fopen(filePath, "rb");
+	fp = fopen(filePath, "rb");
 	if (!fp) {
 		printf("[DBG loadBin] FEHLER kann %s nicht oeffnen\n", filePath);
 		fflush(stdout);
-		*physAddr = 0;
-		return NULL;
+		return onError();
 	}
 
 	fseek(fp, 0, SEEK_END);
@@ -205,22 +229,20 @@ void* loadBin(const char* filePath, uint32_t* physAddr) {
 
 	if (byteSize == 0) {
 		printf("[DBG loadBin] FEHLER Datei ist leer\n");
-		fclose(fp);
-		*physAddr = 0;
-		return NULL;
+		fflush(stdout);
+		return onError();
 	}
 
 	uint32_t stackSize = 150 * 1024; // 150KB total for AP stack, dataOff, taskOff, and transfer buffer
 	g_workerStackOffset = byteSize + stackSize - 4; // Top of the allocation
 
 	// DOS transfer memory: 4096-byte buffer + XMS MoveStruct (258 paragraphs)
-	int dosSel = 0;
 	int dosSeg = __dpmi_allocate_dos_memory(258, &dosSel);
 	if (dosSeg == -1) {
+		dosSel = -1; // nothing was actually allocated, don't try to free it
 		printf("[DBG loadBin] FEHLER Kein DOS-Transfer-Speicher frei\n");
-		fclose(fp);
-		*physAddr = 0;
-		return NULL;
+		fflush(stdout);
+		return onError();
 	}
 
 	// Buffer starts at dosSeg:0000
@@ -235,10 +257,8 @@ void* loadBin(const char* filePath, uint32_t* physAddr) {
 	uint32_t actPhys = allocXMS(byteSize + stackSize, &xmsHandle);
 	if (actPhys == 0) {
 		printf("[DBG loadBin] FEHLER XMS Allokation/Lock fehlgeschlagen\n");
-		__dpmi_free_dos_memory(dosSel);
-		fclose(fp);
-		*physAddr = 0;
-		return NULL;
+		fflush(stdout);
+		return onError();
 	}
 
 	// Initialize the structure in DOS memory
@@ -271,10 +291,8 @@ void* loadBin(const char* filePath, uint32_t* physAddr) {
 
 		if (rregs.x.ax != 1) {
 			printf("[DBG loadBin] FEHLER Sicherer XMS-Transfer fehlgeschlagen\n");
-			__dpmi_free_dos_memory(dosSel);
-			fclose(fp);
-			*physAddr = 0;
-			return NULL;
+			fflush(stdout);
+			return onError();
 		}
 
 		bytesLeft -= chunkSize;
@@ -290,7 +308,7 @@ void* loadBin(const char* filePath, uint32_t* physAddr) {
 		   filePath, (unsigned long)byteSize, (unsigned long)*physAddr);
 	fflush(stdout);
 
-	sysState |= 1;
+	sysState |= SysState_BinLoaded;
 	return (void*)actPhys;
 }
 
@@ -360,6 +378,11 @@ static bool apPanicReport(TaskInt* taskPtr, uint32_t statusOff, uint32_t taskOff
 	return true;
 }
 void CoreTwoAPI::handlePendingInterrupts() {
+	// Handshake on TaskInt::reqInt (set by the AP, cleared by us):
+	//   0 = idle, 1 = AP wants a real-mode INT run on its behalf,
+	//   2 = BSP executed it, registers below are the result.
+	// The AP busy waits for reqInt to leave state 2, so we must always
+	// reset it to 0 once we've copied the results back.
 	asm volatile("mfence" ::: "memory");
 	uint32_t intReq = taskPtr->reqInt;
 
@@ -389,6 +412,9 @@ void CoreTwoAPI::handlePendingInterrupts() {
 }
 
 bool CoreTwoAPI::checkTaskEvent(uint32_t &outTicket, uint32_t &outReady, uint32_t &outMsg, char* outStr) {
+	// Cache line flushes aren't free, so we only pay for them every 100th
+	// poll. Between flushes a stale read just means "no new event yet" --
+	// harmless here, since the caller is expected to poll again soon.
 	static uint32_t pollCount = 0;
 	bool doFlush = (pollCount++ % 100 == 0);
 
@@ -404,7 +430,7 @@ bool CoreTwoAPI::checkTaskEvent(uint32_t &outTicket, uint32_t &outReady, uint32_
 	// Real HW: headIdx is written by the AP, flush before reading.
 	// Otherwise the BSP sees its own stale copy forever.
 	if (doFlush) {
-		bspClflush(resRingO + 0);
+		bspClflush(resRingO + offsetof(ResultRing, headIdx));
 	}
 	asm volatile("" ::: "memory");
 
@@ -415,21 +441,25 @@ bool CoreTwoAPI::checkTaskEvent(uint32_t &outTicket, uint32_t &outReady, uint32_
 		uint32_t dataArrPhys = taskPtr->resRing.dataArrPhys;
 		uint32_t slotO = dataArrPhys + (tail * sizeof(ResultSlot));
 
-		// Fetch the slot data fresh from RAM as well (AP write)
-		bspClflush(slotO + 0);
-		// flush remaining bytes of the slot (second cache line)
-		bspClflush(slotO + 64);
+		// Fetch the slot data fresh from RAM as well (AP write). ResultSlot
+		// is 76 bytes, i.e. spans two cache lines, so flush both.
+		bspClflush(slotO + offsetof(ResultSlot, ticketId));
+		bspClflush(slotO + CACHE_LINE_BYTES);
 
-		outTicket = _farpeekl(_dos_ds, slotO + 0);
-		outReady  = _farpeekl(_dos_ds, slotO + 4);
-		outMsg    = _farpeekl(_dos_ds, slotO + 8);
+		outTicket = _farpeekl(_dos_ds, slotO + offsetof(ResultSlot, ticketId));
+		outReady  = _farpeekl(_dos_ds, slotO + offsetof(ResultSlot, readyFlag));
+		outMsg    = _farpeekl(_dos_ds, slotO + offsetof(ResultSlot, msgVal));
 
-		// Read string conditionally to avoid 64 byte reads
+		// Read string conditionally to avoid the extra 64 byte transfer
+		// when the caller doesn't want it.
 		if (outStr) {
-			dosmemget(slotO + 12, 64, outStr);
-			outStr[63] = '\0';
+			dosmemget(slotO + offsetof(ResultSlot, dbgStr), sizeof(ResultSlot::dbgStr), outStr);
+			outStr[sizeof(ResultSlot::dbgStr) - 1] = '\0';
 		}
 
+		// maxItem mirrors RESULT_RING_SLOTS but is read from the struct
+		// itself (written once at setup) so the BSP and AP always agree,
+		// even if one side were ever rebuilt with a different slot count.
 		uint32_t maxItem = taskPtr->resRing.maxItem;
 		uint32_t nextTail = (tail + 1) % maxItem;
 
@@ -484,6 +514,8 @@ void endTask() {
 // Derives memoryBase/payloadBase, taskPtr and all task field offsets from the
 // current alignPhysical / taskOff. Requires both to be set. setupSys calls this
 // twice (initial layout and after trampoline setup), so the block lives once.
+// The offsetof() calls below are checked against apboot.asm's expectations
+// by the static_asserts next to TaskInt/ResultRing/ResultSlot in 2core.h.
 void CoreTwoAPI::recomputeOffsets() {
 	memoryBase  = alignPhysical;
 	payloadBase = alignPhysical + MEM_OFF_PAYLOAD;
@@ -511,7 +543,7 @@ bool CoreTwoAPI::setupSys(const char* filePath) {
 		return false;
 	}
 
-	// Phase 2: load worker binary
+	// load worker binary
 	void* binPtr = loadBin(filePath, &this->workerPhys);
 	if (!binPtr) {
 		return false;
@@ -550,11 +582,10 @@ bool CoreTwoAPI::setupSys(const char* filePath) {
 	void (*tmpTerm)(int) = signal(SIGTERM, catchSig);
 	if (tmpTerm != SIG_ERR) oldTerm = tmpTerm;
 	atexit(endTask);
-	sysState |= 2;
+	sysState |= SysState_TaskReady;
 
 	// Build trampoline
 	constexpr uint32_t TRAM_SZ = 8192;
-	constexpr uint32_t CACHE_L = 64;
 
 	// prepTram reuses the same alignPhysical base; taskOff/dataOff already set.
 	trampolinPage = (uint8_t)((alignPhysical & 0xFF000) >> 12);
@@ -595,7 +626,7 @@ bool CoreTwoAPI::setupSys(const char* filePath) {
     asm volatile("mfence" ::: "memory");
 
 	// Flush the trampoline region out of the BSP cache before the AP starts
-	for (uint32_t addr = memoryBase; addr < memoryBase + TRAM_SZ; addr += CACHE_L) {
+	for (uint32_t addr = memoryBase; addr < memoryBase + TRAM_SZ; addr += CACHE_LINE_BYTES) {
 		asm volatile(
 			"push %%fs \n\t"
 			"mov %1, %%fs \n\t"
@@ -610,7 +641,7 @@ bool CoreTwoAPI::setupSys(const char* filePath) {
 	printf("[setupSys] memBase=0x%08X workerEntry=0x%08X\n", memoryBase, workerPhys);
 	printf("[setupSys] arg1=0x%08X arg2=0x%08X\n", dataOff, taskOff);
 
-	sysState |= 4;
+	sysState |= SysState_TrampReady;
 	return true;
 }
 
@@ -733,7 +764,8 @@ uint32_t CoreTwoAPI::startAp(uint8_t apicId) {
 }
 
 void CoreTwoAPI::spawn(uint32_t physAddr) {
-	if ((sysState & 6) != 6 || physAddr == 0) return;
+	constexpr uint8_t kReadyMask = SysState_TaskReady | SysState_TrampReady;
+	if ((sysState & kReadyMask) != kReadyMask || physAddr == 0) return;
 
 	taskPtr->funcPtr = physAddr;
 	taskPtr->input = dataOff;
@@ -744,7 +776,7 @@ void CoreTwoAPI::spawn(uint32_t physAddr) {
 }
 
 void CoreTwoAPI::pollDbg(uint32_t flagVal) {
-	// backward compatibility
+	// Intentional no-op, kept only so older call sites still link.
 }
 
 ApStatus CoreTwoAPI::status() {
@@ -796,7 +828,7 @@ void CoreTwoAPI::wakeAp() {
 	// asleep flag. Store-load barrier, producer side of Dekker.
 	asm volatile("mfence" ::: "memory");
 
-	// Lost-wakeup race: the AP can miss an NMI in the window
+	// Lost wakeup race: the AP can miss an NMI in the window
 	// between setting the asleep flag and the hlt instruction.
 	// So repeat the NMI until the AP acknowledges the wake.
 	// If the core is already awake this is an immediate no-op.

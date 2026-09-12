@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <cstddef>   // offsetof
 #include <dpmi.h>
 #include <dos.h>
 #include <sys/farptr.h>
@@ -35,6 +36,17 @@ struct ResultSlot {
 	char     dbgStr[64];
 } __attribute__((packed, aligned(4)));
 
+// ResultSlot's field offsets are read/written by raw offsetof() based
+// arithmetic in 2core.cc and are also relied upon by the
+// AP side worker that fills the slot. If this struct is ever changed, these
+// asserts fail loudly at compile time instead of silently corrupting the
+// BSP<->AP result protocol.
+static_assert(offsetof(ResultSlot, ticketId)  == 0,  "ResultSlot layout changed, update AP side");
+static_assert(offsetof(ResultSlot, readyFlag) == 4,  "ResultSlot layout changed, update AP side");
+static_assert(offsetof(ResultSlot, msgVal)    == 8,  "ResultSlot layout changed, update AP side");
+static_assert(offsetof(ResultSlot, dbgStr)    == 12, "ResultSlot layout changed, update AP side");
+static_assert(sizeof(ResultSlot) == 76, "ResultSlot size changed - update AP side ");
+
 #define RESULT_RING_SLOTS 32 
 
 struct ResultRing {
@@ -44,7 +56,6 @@ struct ResultRing {
 	uint32_t dataArrPhys;
 	ResultSlot	  dataArr[RESULT_RING_SLOTS];
 } __attribute__((packed, aligned(4)));
-
 
 struct TaskInt {
 	volatile ApCmd    cmd;              // offset   0
@@ -69,6 +80,8 @@ struct TaskInt {
 	ResultRing        resRing;          // offset 584
 } __attribute__((packed, aligned(4)));
 
+static_assert(sizeof(TaskInt) == 3032, "TaskInt size changed - update apboot.asm / stack layout math");
+
 extern "C" void* loadBin(const char* filePath, uint32_t* physAddr);
 void cpu2Main();
 uint32_t logPhys(void *logPtr);
@@ -85,7 +98,6 @@ public:
 	uint32_t physAddress;
 	uint32_t alignPhysical;
 	uint8_t trampolinPage;
-	int apicSel;
 	TaskInt *taskPtr;
 
 	uint32_t memoryBase;
@@ -104,6 +116,7 @@ public:
 
 	uint32_t startAp(uint8_t apicId = 1);
 	void spawn(uint32_t blockStart);
+	// No-op kept only so older call sites still link; does nothing.
 	void pollDbg(uint32_t flagVal);
 	ApStatus status();
 	uint32_t getRes();
@@ -123,7 +136,6 @@ public:
 	void recomputeOffsets();
 	uint32_t workerPhys = 0;
 private:
-	void* workerHeap = nullptr;
 	uint32_t ticketIdOff;
 };
 
